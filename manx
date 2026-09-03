@@ -469,7 +469,7 @@ def highlight_command(cmd_raw):
     parts.append(f"{C_CMD}{cmd_raw[last_idx:]}{NC}")
     return "".join(parts)
 
-def render_unified_card(cmd_name):
+def render_unified_card(cmd_name, is_preview=True):
     cmd_name = cmd_name.strip()
     tldr_idx = get_tldr_index()
     man_idx = get_system_man_index()
@@ -532,12 +532,16 @@ def render_unified_card(cmd_name):
 
     # Footer navigation hints
     print(f"{C_DIM}─────────────────────────────────────────────────────────────────────────────{NC}")
-    print(f"  {C_OPT}Actions:{NC} [Enter] Pick & Copy Snippet  {C_MUTED}•{NC}  [Ctrl-O] Full Manual  {C_MUTED}•{NC}  [Ctrl-W] cheat.sh\n")
+    if is_preview:
+        print(f"  {C_OPT}Actions:{NC} [Enter] Pick & Copy Snippet  {C_MUTED}•{NC}  [Ctrl-O] Full Manual  {C_MUTED}•{NC}  [Ctrl-W] cheat.sh\n")
+    else:
+        print(f"  {C_OPT}Hint:{NC} Run `manx {cmd_name}` for interactive picker or `manx -m {cmd_name}` for full manual.\n")
 
 # --- INTERACTIVE SNIPPET PICKER ---
-def launch_snippet_picker(cmd_name):
+def launch_snippet_picker(cmd_name, print_on_cancel=True):
     cmd_name = cmd_name.strip()
     tldr_idx = get_tldr_index()
+    man_idx = get_system_man_index()
     builtins = get_bash_builtins()
 
     data = None
@@ -545,9 +549,18 @@ def launch_snippet_picker(cmd_name):
         data = parse_tldr_file(tldr_idx[cmd_name])
 
     examples = data.get("examples", []) if data else []
+    desc = ""
+    if data and data.get("description"):
+        desc = data["description"]
+    elif cmd_name in man_idx:
+        desc = man_idx[cmd_name]
+    elif cmd_name in builtins:
+        desc = builtins[cmd_name]
 
     if not examples:
-        # Fallback if no specific tldr examples
+        if cmd_name in builtins:
+            render_unified_card(cmd_name, is_preview=False)
+            return
         print_action(f"No predefined snippets for '{cmd_name}'. Opening full manual...")
         open_full_man(cmd_name)
         return
@@ -556,22 +569,31 @@ def launch_snippet_picker(cmd_name):
     fzf_lines = []
     for idx, eg in enumerate(examples, start=1):
         clean = eg["clean_cmd"]
-        desc = eg["desc"]
-        fzf_lines.append(f"[{idx}] {clean} \t:: {desc}")
+        eg_desc = eg["desc"]
+        fzf_lines.append(f"[{idx}] {clean} \t:: {eg_desc}")
 
-    # Add option to open full manual
-    fzf_lines.append(f"[0] 📖 Open Full System Manual (man {cmd_name}) \t:: Complete reference")
+    # Add option to open full manual & cheat.sh
+    fzf_lines.append(f"[m] 📖 Open Full System Manual (man {cmd_name}) \t:: Complete reference")
+    fzf_lines.append(f"[w] 🌐 Query cheat.sh Community Cheatsheet \t:: Community snippets")
 
     fzf_input = "\n".join(fzf_lines)
+    script_path = os.path.abspath(__file__)
+
+    short_desc = (desc[:60] + "...") if len(desc) > 60 else desc
+    header_text = f":: {cmd_name} — {short_desc}\n[Enter] Copy & Output  •  [Ctrl-O] Full Man  •  [Ctrl-W] cheat.sh  •  [Esc] Cancel"
+
     cmd = [
         "fzf",
         "--ansi",
-        f"--prompt=➜ {cmd_name} snippet: ",
-        "--header=:: [Enter] Copy to Clipboard & Output  •  [Esc] Cancel",
+        f"--prompt=:: {cmd_name} ➜ ",
+        f"--header={header_text}",
         "--delimiter=\t:: ",
         "--with-nth=1,2",
-        "--height=50%",
-        "--reverse",
+        f"--preview={script_path} --preview {cmd_name}",
+        "--preview-window=right,55%,wrap,<100(bottom,50%,wrap)",
+        f"--bind=ctrl-o:execute({script_path} -m {cmd_name})",
+        f"--bind=ctrl-w:change-preview({script_path} --preview-web {cmd_name})",
+        f"--bind=ctrl-t:change-preview({script_path} --preview {cmd_name})",
         "--color=bg+:#1f2335,bg:#1a1b26,spinner:#7aa2f7,hl:#7dcfff,fg:#c0caf5,header:#7aa2f7,info:#e0af68,pointer:#bb9af7,marker:#9ece6a,fg+:#c0caf5,prompt:#bb9af7,hl+:#7dcfff"
     ]
 
@@ -579,11 +601,16 @@ def launch_snippet_picker(cmd_name):
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         out, _ = p.communicate(input=fzf_input)
         if p.returncode != 0 or not out.strip():
+            if print_on_cancel:
+                render_unified_card(cmd_name, is_preview=False)
             return
 
         selected = out.strip()
-        if "[0] 📖 Open Full System Manual" in selected:
+        if "[m] 📖 Open Full System Manual" in selected:
             open_full_man(cmd_name)
+            return
+        elif "[w] 🌐 Query cheat.sh Community" in selected:
+            preview_web(cmd_name)
             return
 
         # Extract snippet command
@@ -594,12 +621,12 @@ def launch_snippet_picker(cmd_name):
         # Copy to clipboard
         copy_to_clipboard(chosen_cmd)
 
-        print_succ(f"Copied to clipboard:")
+        print_succ("Copied to clipboard:")
         print(f"\n  {C_CMD}{chosen_cmd}{NC}\n")
 
     except FileNotFoundError:
         print_err("fzf is not installed or not found in PATH.")
-        sys.exit(1)
+        render_unified_card(cmd_name, is_preview=False)
 
 # --- FULL MAN PAGER ---
 def open_full_man(cmd_name):
@@ -815,7 +842,8 @@ def print_help():
 
 {C_BOLD}USAGE:{NC}
   manx                     Launch interactive FZF command palette & snippet picker
-  manx <command>           Display unified cheatsheet card directly in terminal
+  manx <command>           Open interactive snippet picker with live preview
+  manx -p, --print <cmd>   Display static cheatsheet card directly in terminal
   manx -s, --snippet <cmd> Open interactive snippet picker for a specific command
   manx -m, --man <cmd>     Open full system man page formatted with bat/less
   manx -w, --web <cmd>     Query cheat.sh community cheatsheet
@@ -853,6 +881,12 @@ def main():
     elif arg1 == "--copy-top":
         if len(sys.argv) > 2:
             copy_top_snippet(sys.argv[2])
+        return
+    elif arg1 in ("-p", "--print"):
+        if len(sys.argv) > 2:
+            render_unified_card(sys.argv[2], is_preview=False)
+        else:
+            print_err("Command required: `manx --print <command>`")
         return
     elif arg1 in ("-s", "--snippet"):
         if len(sys.argv) > 2:
@@ -899,7 +933,10 @@ def main():
         sys.exit(1)
     else:
         # Standard query: manx <command>
-        render_unified_card(arg1)
+        if sys.stdout.isatty():
+            launch_snippet_picker(arg1, print_on_cancel=True)
+        else:
+            render_unified_card(arg1, is_preview=False)
 
 if __name__ == "__main__":
     main()
