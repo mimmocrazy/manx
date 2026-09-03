@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""
+==============================================================================
+:: manx — Modern Unified CLI Documentation & Interactive Cheatsheet System
+Design System: command-not-found / Tokyo Night Terminal Aesthetics
+==============================================================================
+"""
+
+import sys
+import os
+import re
+import time
+import json
+import shutil
+import base64
+import signal
+import atexit
+import hashlib
+import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+
+VERSION = "1.0.0"
+
+# --- ANSI PALETTE (tool_design standard) ---
+C_HEAD   = '\033[1;38;5;111m'  # Pastel Periwinkle Blue (::)
+C_BOLD   = '\033[1m'           # Crisp White Bold
+C_PROMPT = '\033[38;5;141m'    # Soft Lavender (➜, sections, indexes)
+C_ACTION = '\033[34m'          # Classic Blue
+C_SUCC   = '\033[32m'          # Soft Mint Green (✔)
+C_ERR    = '\033[38;5;203m'     # Pastel Rose / Coral (✖)
+C_WARN   = '\033[38;5;222m'     # Warm Amber / Gold
+C_OPT    = '\033[38;5;103m'     # Slate Gray-Blue (options, meta)
+C_TEXT   = '\033[38;5;189m'     # Soft Ice Lavender text
+C_CMD    = '\033[1;38;5;222m'  # Gold / Code commands
+C_PARAM  = '\033[1;38;5;117m'  # Cyan / Variable arguments {{...}}
+C_MUTED  = '\033[38;5;60m'      # Deep Muted Slate
+C_DIM    = '\033[38;5;241m'     # Dim Gray
+NC       = '\033[0m'           # Reset
+
+# Restore cursor on exit
+def restore_cursor():
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+
+atexit.register(restore_cursor)
+
+def sigint_handler(sig, frame):
+    restore_cursor()
+    sys.exit(130)
+
+signal.signal(signal.SIGINT, sigint_handler)
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except Exception:
+    pass
+
+# --- UI HELPER FUNCTIONS ---
+def print_head(title):
+    print(f"\n{C_HEAD}:: {C_BOLD}{title}{NC}")
+
+def print_subhead(title):
+    print(f"\n{C_HEAD}:: {C_BOLD}{title}{NC}")
+
+def print_action(text):
+    print(f"  {C_ACTION}➜{NC} {text}")
+
+def print_succ(text):
+    print(f"  {C_SUCC}✔{NC} {text}")
+
+def print_err(text):
+    print(f"  {C_ERR}✖{NC} {text}", file=sys.stderr)
+
+# --- CLIPBOARD ENGINE (Wayland, X11, and OSC 52 fallback) ---
+def copy_to_clipboard(text):
+    text_clean = text.strip()
+    copied = False
+
+    # 1. Wayland wl-copy
+    if shutil.which("wl-copy"):
+        try:
+            p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            p.communicate(input=text_clean.encode("utf-8"), timeout=1.5)
+            if p.returncode == 0:
+                copied = True
+        except Exception:
+            pass
+
+    # 2. X11 xclip
+    if not copied and shutil.which("xclip"):
+        try:
+            p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            p.communicate(input=text_clean.encode("utf-8"), timeout=1.5)
+            if p.returncode == 0:
+                copied = True
+        except Exception:
+            pass
+
+    # 3. OSC 52 escape sequence (works seamlessly in SSH / tmux / modern terminals)
+    try:
+        b64 = base64.b64encode(text_clean.encode("utf-8")).decode("ascii")
+        osc52 = f"\033]52;c;{b64}\a"
+        if sys.stdout.isatty():
+            sys.stdout.write(osc52)
+            sys.stdout.flush()
+        elif os.path.exists("/dev/tty"):
+            with open("/dev/tty", "w") as tty:
+                tty.write(osc52)
+                tty.flush()
+        copied = True
+    except Exception:
+        pass
+
+    return copied
+
+# --- PATHS & CACHING ---
+def get_cache_dir():
+    cache_dir = os.path.expanduser("~/.cache/manx")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(os.path.join(cache_dir, "cheat"), exist_ok=True)
+    os.makedirs(os.path.join(cache_dir, "explain"), exist_ok=True)
+    return cache_dir
+
+def find_tldr_root():
+    candidates = [
+        os.path.expanduser("~/.cache/tldr/pages"),
+        os.path.expanduser("~/.local/share/tldr/pages"),
+        "/usr/share/tldr/pages",
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
+
+# --- TLDR PARSER ---
+_TLDR_INDEX = None
+
+def get_tldr_index():
+    global _TLDR_INDEX
+    if _TLDR_INDEX is not None:
+        return _TLDR_INDEX
+
+    root = find_tldr_root()
+    index = {}
+    if not root:
+        _TLDR_INDEX = index
+        return index
+
+    # Order of priority: linux, common, osx, others
+    platforms = ["sunos", "windows", "freebsd", "openbsd", "netbsd", "android", "osx", "common", "linux"]
+    for plat in platforms:
+        pdir = os.path.join(root, plat)
+        if os.path.isdir(pdir):
+            try:
+                for entry in os.scandir(pdir):
+                    if entry.name.endswith(".md"):
+                        cmd_name = entry.name[:-3]
+                        index[cmd_name] = entry.path
+            except Exception:
+                pass
+
+    _TLDR_INDEX = index
+    return index
+
+def parse_tldr_file(filepath):
+    """
+    Parses a TLDR markdown file into structured data:
+    {
+      'name': str,
+      'description': str,
+      'docs': str,
+      'examples': [{'desc': str, 'raw_cmd': str, 'clean_cmd': str}]
+    }
+    """
+    if not os.path.isfile(filepath):
+        return None
+
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+
+    name = ""
+    desc_lines = []
+    docs_url = ""
+    examples = []
+    current_desc = None
+
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+
+        if s.startswith("# "):
+            name = s[2:].strip()
+        elif s.startswith("> "):
+            content = s[2:].strip()
+            if "More information:" in content:
+                m = re.search(r"<(https?://[^>]+)>|(https?://\S+)", content)
+                if m:
+                    docs_url = m.group(1) or m.group(2)
+            elif "See also:" in content:
+                desc_lines.append(content)
+            else:
+                desc_lines.append(content)
+        elif s.startswith("- "):
+            current_desc = s[2:].rstrip(":").strip()
+        elif s.startswith("`") and s.endswith("`") and len(s) >= 2:
+            raw_cmd = s[1:-1].strip()
+            clean_cmd = re.sub(r"\{\{([^}]+)\}\}", r"\1", raw_cmd)
+            if current_desc:
+                examples.append({
+                    "desc": current_desc,
+                    "raw_cmd": raw_cmd,
+                    "clean_cmd": clean_cmd
+                })
+                current_desc = None
+
+    return {
+        "name": name,
+        "description": " ".join(desc_lines),
+        "docs": docs_url,
+        "examples": examples
+    }
+
+# --- SYSTEM MAN & BUILTINS INDEXER ---
+def get_bash_builtins():
+    # Builtin descriptions for commands that man fails on
+    return {
+        "alias": "Define or display shell aliases",
+        "bg": "Move jobs to the background",
+        "bind": "Set Readline key bindings and variables",
+        "break": "Exit for, while, or until loops",
+        "builtin": "Execute shell builtins",
+        "caller": "Return caller of current subroutine",
+        "cd": "Change the shell working directory",
+        "command": "Execute a simple command or display information about commands",
+        "complete": "Specify how arguments are to be completed for commands",
+        "continue": "Resume the next iteration of a loop",
+        "dirs": "Display directory stack",
+        "disown": "Remove jobs from current shell",
+        "echo": "Write arguments to standard output",
+        "enable": "Enable and disable shell builtins",
+        "eval": "Execute arguments as a shell command",
+        "exec": "Replace the shell with the given command",
+        "exit": "Exit the shell",
+        "export": "Set export attribute for shell variables",
+        "fc": "Display or edit history commands",
+        "fg": "Move jobs to the foreground",
+        "getopts": "Parse utility options",
+        "hash": "Remember or report utility locations",
+        "help": "Display information about builtin commands",
+        "history": "Display or manipulate the history list",
+        "jobs": "Display status of jobs in the current session",
+        "kill": "Send a signal to a process",
+        "let": "Evaluate arithmetic expressions",
+        "local": "Define local variables",
+        "logout": "Exit a login shell",
+        "popd": "Remove directories from directory stack",
+        "printf": "Format and print data",
+        "pushd": "Add directories to directory stack",
+        "pwd": "Print the current working directory",
+        "read": "Read a line from standard input into variables",
+        "readonly": "Mark variables/functions as read-only",
+        "return": "Return from a function",
+        "set": "Set or unset values of shell options and positional parameters",
+        "shift": "Shift positional parameters",
+        "shopt": "Set and unset shell options",
+        "source": "Execute commands from a file in the current shell",
+        "suspend": "Suspend execution of this shell",
+        "test": "Evaluate conditional expression",
+        "times": "Display process times",
+        "trap": "Trap signals and other events",
+        "type": "Display information about command type",
+        "typeset": "Set variable values and attributes",
+        "ulimit": "Modify shell resource limits",
+        "umask": "Display or set file mode creation mask",
+        "unalias": "Remove alias definitions",
+        "unset": "Unset values and attributes of variables and functions",
+        "wait": "Wait for process completion and return exit status",
+    }
+
+def get_system_man_index():
+    cache_file = os.path.join(get_cache_dir(), "man_index.json")
+
+    # If cache exists and is newer than 24 hours, use it
+    if os.path.isfile(cache_file):
+        try:
+            mtime = os.path.getmtime(cache_file)
+            if time.time() - mtime < 86400:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+
+    mans = {}
+    try:
+        res = subprocess.run(["man", "-k", "."], capture_output=True, text=True, errors="replace")
+        for line in res.stdout.splitlines():
+            if " - " in line:
+                parts = line.split(" - ", 1)
+                name_part = parts[0].strip()
+                desc = parts[1].strip()
+                # e.g., 'find (1)' -> 'find'
+                cmd = name_part.split()[0].rstrip(",;:")
+                if cmd and cmd not in mans:
+                    mans[cmd] = desc
+    except Exception:
+        pass
+
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(mans, f)
+    except Exception:
+        pass
+
+    return mans
+
+def get_all_commands():
+    """
+    Returns sorted list of tuples: (cmd, desc, source_flag)
+    """
+    tldr_idx = get_tldr_index()
+    man_idx = get_system_man_index()
+    builtins = get_bash_builtins()
+
+    all_names = set(tldr_idx.keys()) | set(man_idx.keys()) | set(builtins.keys())
+    result = []
+
+    for cmd in sorted(all_names):
+        # Determine best description
+        desc = ""
+        source = "man"
+        if cmd in tldr_idx:
+            source = "tldr"
+            # Fast peek description from tldr or fallback to man
+            desc = man_idx.get(cmd, "")
+        elif cmd in builtins:
+            source = "builtin"
+            desc = builtins[cmd]
+        else:
+            desc = man_idx.get(cmd, "")
+
+        result.append((cmd, desc, source))
+
+    return result
+
+# --- CHEAT.SH CLIENT & CACHE ---
+def fetch_cheat_sh(cmd):
+    cache_path = os.path.join(get_cache_dir(), "cheat", f"{cmd}.txt")
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            pass
+
+    url = f"https://cheat.sh/{urllib.parse.quote(cmd)}?T"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "curl/7.88.1"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+            # Strip cheat.sh header comments if any
+            clean_lines = []
+            for line in content.splitlines():
+                if line.startswith("#[cheat.sheets"):
+                    continue
+                clean_lines.append(line)
+            content = "\n".join(clean_lines).strip()
+            if content and "Unknown topic" not in content:
+                try:
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                except Exception:
+                    pass
+                return content
+    except Exception:
+        pass
+
+    return None
+
+# --- EXPLAIN ENGINE (Mankier API & Offline Regex Parser) ---
+def fetch_mankier_explain(cmd_string):
+    cmd_clean = cmd_string.strip()
+    h = hashlib.sha256(cmd_clean.encode("utf-8")).hexdigest()[:16]
+    cache_path = os.path.join(get_cache_dir(), "explain", f"{h}.txt")
+
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            pass
+
+    cols = shutil.get_terminal_size().columns
+    url = f"https://www.mankier.com/api/v2/explain/?cols={cols}&q={urllib.parse.quote(cmd_clean)}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "manx-cli/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            data = resp.read().decode("utf-8", errors="replace").strip()
+            if data:
+                try:
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        f.write(data)
+                except Exception:
+                    pass
+                return data
+    except Exception:
+        pass
+
+    # Offline fallback
+    return offline_explain(cmd_clean)
+
+def offline_explain(cmd_string):
+    tokens = cmd_string.strip().split()
+    if not tokens:
+        return "Empty command."
+
+    base_cmd = os.path.basename(tokens[0])
+    flags = [t for t in tokens[1:] if t.startswith("-")]
+
+    lines = [f"{base_cmd}(1) — Local Offline Flag Breakdown\n"]
+    if not flags:
+        lines.append("  No specific command-line flags detected.")
+        return "\n".join(lines)
+
+    # Read man page
+    try:
+        res = subprocess.run(["man", base_cmd], capture_output=True, text=True, errors="replace")
+        man_text = subprocess.run(["col", "-bx"], input=res.stdout, capture_output=True, text=True).stdout
+    except Exception:
+        man_text = ""
+
+    for flag in flags:
+        lines.append(f"  {flag}")
+        if man_text:
+            pattern = rf"(?:^|\n)\s+({re.escape(flag)}(?:[=,\s][^\n]+)?)\n((?:\s{{4,}}[^\n]+\n)+)"
+            m = re.search(pattern, man_text)
+            if m:
+                desc = re.sub(r"\s+", " ", m.group(2).strip())
+                lines.append(f"    {desc[:240]}...\n")
+            else:
+                lines.append("    Flag found in command (refer to full man page for details).\n")
+        else:
+            lines.append("    Standard command argument.\n")
+
+    return "\n".join(lines)
+
+# --- UNIFIED CARD RENDERER ---
+def highlight_command(cmd_raw):
+    """
+    Highlights {{placeholder}} inside command strings
+    """
+    parts = []
+    last_idx = 0
+    for m in re.finditer(r"\{\{([^}]+)\}\}", cmd_raw):
+        parts.append(f"{C_CMD}{cmd_raw[last_idx:m.start()]}{NC}")
+        parts.append(f"{C_PARAM}{m.group(1)}{NC}")
+        last_idx = m.end()
+    parts.append(f"{C_CMD}{cmd_raw[last_idx:]}{NC}")
+    return "".join(parts)
+
+def render_unified_card(cmd_name):
+    cmd_name = cmd_name.strip()
+    tldr_idx = get_tldr_index()
+    man_idx = get_system_man_index()
+    builtins = get_bash_builtins()
+
+    data = None
+    if cmd_name in tldr_idx:
+        data = parse_tldr_file(tldr_idx[cmd_name])
+
+    # Header section
+    desc = ""
+    if data and data.get("description"):
+        desc = data["description"]
+    elif cmd_name in man_idx:
+        desc = man_idx[cmd_name]
+    elif cmd_name in builtins:
+        desc = builtins[cmd_name]
+    else:
+        desc = "System Command"
+
+    print(f"\n{C_HEAD}:: {C_BOLD}{cmd_name}{NC} \033[38;5;60m— {desc}{NC}")
+
+    if data and data.get("docs"):
+        print(f"  {C_ACTION}➜{NC} {C_OPT}Docs:{NC} \033[4;38;5;111m{data['docs']}{NC}")
+
+    # Top practical cheatsheets
+    if data and data.get("examples"):
+        print(f"\n{C_HEAD}:: {C_BOLD}Top Cheatsheet & Practical Examples{NC}")
+        for idx, eg in enumerate(data["examples"], start=1):
+            num = f"{C_PROMPT}[{idx}]{NC}"
+            desc_text = f"{C_TEXT}{eg['desc']}{NC}"
+            cmd_styled = highlight_command(eg["raw_cmd"])
+            print(f"  {num} {desc_text}")
+            print(f"      {C_ACTION}➜{NC} {cmd_styled}\n")
+    else:
+        # Check if it's a builtin
+        if cmd_name in builtins:
+            print(f"\n{C_HEAD}:: {C_BOLD}Shell Builtin Syntax{NC}")
+            try:
+                res = subprocess.run(["bash", "-c", f"help {cmd_name}"], capture_output=True, text=True)
+                lines = [l for l in res.stdout.splitlines() if l.strip()][:15]
+                for l in lines:
+                    print(f"  {C_TEXT}{l}{NC}")
+            except Exception:
+                print(f"  {C_TEXT}{builtins[cmd_name]}{NC}")
+        else:
+            # Fallback: check cheat.sh or man synopsis
+            print(f"\n{C_HEAD}:: {C_BOLD}System Manual Overview{NC}")
+            try:
+                res = subprocess.run(["man", cmd_name], capture_output=True, text=True, errors="replace")
+                raw = subprocess.run(["col", "-bx"], input=res.stdout, capture_output=True, text=True).stdout
+                m = re.search(r"SYNOPSIS\n(.*?)\n\n[A-Z]", raw, re.DOTALL)
+                if m:
+                    print(f"  {C_ACTION}➜{NC} {C_BOLD}SYNOPSIS:{NC}")
+                    for s_line in m.group(1).strip().splitlines()[:6]:
+                        print(f"    {C_CMD}{s_line.strip()}{NC}")
+            except Exception:
+                pass
+            print(f"\n  {C_OPT}Press [Ctrl-O] or run `manx -m {cmd_name}` for the complete manual.{NC}")
+
+    # Footer navigation hints
+    print(f"{C_DIM}─────────────────────────────────────────────────────────────────────────────{NC}")
+    print(f"  {C_OPT}Actions:{NC} [Enter] Pick & Copy Snippet  {C_MUTED}•{NC}  [Ctrl-O] Full Manual  {C_MUTED}•{NC}  [Ctrl-W] cheat.sh\n")
+
+# --- INTERACTIVE SNIPPET PICKER ---
+def launch_snippet_picker(cmd_name):
+    cmd_name = cmd_name.strip()
+    tldr_idx = get_tldr_index()
+    builtins = get_bash_builtins()
+
+    data = None
+    if cmd_name in tldr_idx:
+        data = parse_tldr_file(tldr_idx[cmd_name])
+
+    examples = data.get("examples", []) if data else []
+
+    if not examples:
+        # Fallback if no specific tldr examples
+        print_action(f"No predefined snippets for '{cmd_name}'. Opening full manual...")
+        open_full_man(cmd_name)
+        return
+
+    # Prepare FZF lines
+    fzf_lines = []
+    for idx, eg in enumerate(examples, start=1):
+        clean = eg["clean_cmd"]
+        desc = eg["desc"]
+        fzf_lines.append(f"[{idx}] {clean} \t:: {desc}")
+
+    # Add option to open full manual
+    fzf_lines.append(f"[0] 📖 Open Full System Manual (man {cmd_name}) \t:: Complete reference")
+
+    fzf_input = "\n".join(fzf_lines)
+    cmd = [
+        "fzf",
+        "--ansi",
+        f"--prompt=➜ {cmd_name} snippet: ",
+        "--header=:: [Enter] Copy to Clipboard & Output  •  [Esc] Cancel",
+        "--delimiter=\t:: ",
+        "--with-nth=1,2",
+        "--height=50%",
+        "--reverse",
+        "--color=bg+:#1f2335,bg:#1a1b26,spinner:#7aa2f7,hl:#7dcfff,fg:#c0caf5,header:#7aa2f7,info:#e0af68,pointer:#bb9af7,marker:#9ece6a,fg+:#c0caf5,prompt:#bb9af7,hl+:#7dcfff"
+    ]
+
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        out, _ = p.communicate(input=fzf_input)
+        if p.returncode != 0 or not out.strip():
+            return
+
+        selected = out.strip()
+        if "[0] 📖 Open Full System Manual" in selected:
+            open_full_man(cmd_name)
+            return
+
+        # Extract snippet command
+        # Format: '[1] cmd ... \t:: desc'
+        m = re.match(r"^\[\d+\]\s*(.*?)(?:\s*\t::.*)?$", selected)
+        chosen_cmd = m.group(1).strip() if m else selected
+
+        # Copy to clipboard
+        copy_to_clipboard(chosen_cmd)
+
+        print_succ(f"Copied to clipboard:")
+        print(f"\n  {C_CMD}{chosen_cmd}{NC}\n")
+
+    except FileNotFoundError:
+        print_err("fzf is not installed or not found in PATH.")
+        sys.exit(1)
+
+# --- FULL MAN PAGER ---
+def open_full_man(cmd_name):
+    cmd_name = cmd_name.strip()
+    if shutil.which("bat"):
+        os.system(f"man {cmd_name} 2>/dev/null | col -bx | bat -l man -p --paging=always || man {cmd_name}")
+    else:
+        os.system(f"man {cmd_name}")
+
+# --- REVERSE SEARCH ---
+def search_cheatsheets(query):
+    query_raw = query.strip()
+    query_lower = query_raw.lower()
+    root = find_tldr_root()
+    if not root:
+        print_err("TLDR pages directory not found.")
+        return
+
+    print_head(f"Reverse Search: '{query_raw}'")
+    scored_matches = []
+
+    pattern = re.compile(rf"\b{re.escape(query_lower)}\b", re.IGNORECASE)
+
+    platforms = ["common", "linux", "osx"]
+    seen_cmds = set()
+    for plat in platforms:
+        pdir = os.path.join(root, plat)
+        if os.path.isdir(pdir):
+            for entry in os.scandir(pdir):
+                if entry.name.endswith(".md"):
+                    cmd_name = entry.name[:-3]
+                    if cmd_name in seen_cmds:
+                        continue
+                    seen_cmds.add(cmd_name)
+                    try:
+                        with open(entry.path, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                        content_lower = content.lower()
+                        if query_lower in content_lower:
+                            score = 0
+                            if cmd_name.lower() == query_lower:
+                                score += 200
+                            elif cmd_name.lower().startswith(query_lower):
+                                score += 80
+                            elif pattern.search(cmd_name.lower()):
+                                score += 50
+
+                            data = parse_tldr_file(entry.path)
+                            if data:
+                                desc = data.get("description", "")
+                                if pattern.search(desc.lower()):
+                                    score += 40
+                                elif query_lower in desc.lower():
+                                    score += 15
+
+                                matching_egs = []
+                                for eg in data.get("examples", []):
+                                    eg_desc = eg.get("desc", "")
+                                    eg_cmd = eg.get("raw_cmd", "")
+                                    eg_score = 0
+                                    if pattern.search(eg_desc.lower()):
+                                        eg_score += 20
+                                    elif query_lower in eg_desc.lower():
+                                        eg_score += 10
+
+                                    if pattern.search(eg_cmd.lower()):
+                                        eg_score += 15
+                                    elif query_lower in eg_cmd.lower():
+                                        eg_score += 5
+
+                                    if eg_score > 0:
+                                        matching_egs.append((eg, eg_score))
+                                        score += eg_score
+
+                                if score > 0:
+                                    matching_egs.sort(key=lambda x: x[1], reverse=True)
+                                    top_egs = [x[0] for x in matching_egs]
+                                    scored_matches.append((score, cmd_name, desc, top_egs))
+                    except Exception:
+                        pass
+
+    if not scored_matches:
+        print(f"  {C_ERR}✖{NC} No cheatsheet matches found for '{query_raw}'.\n")
+        return
+
+    scored_matches.sort(key=lambda x: x[0], reverse=True)
+
+    print(f"  {C_ACTION}➜{NC} Found {C_BOLD}{len(scored_matches)}{NC} matching commands (showing top 10):\n")
+    for score, cmd_name, desc, egs in scored_matches[:10]:
+        print(f"  {C_HEAD}:: {C_BOLD}{cmd_name}{NC} {C_OPT}— {desc}{NC}")
+        for eg in egs[:2]:
+            clean_cmd = highlight_command(eg["raw_cmd"])
+            print(f"     {C_TEXT}• {eg['desc']}{NC}")
+            print(f"       ➜ {clean_cmd}")
+        print()
+
+# --- MAIN INTERACTIVE FZF BROWSER ---
+def launch_main_fzf():
+    all_cmds = get_all_commands()
+
+    # Format lines for FZF: "command\t:: description"
+    fzf_lines = []
+    for cmd, desc, source in all_cmds:
+        tag = f"[{source}]"
+        fzf_lines.append(f"{cmd}\t:: {tag} {desc}")
+
+    fzf_input = "\n".join(fzf_lines)
+    script_path = os.path.abspath(__file__)
+
+    fzf_cmd = [
+        "fzf",
+        "--ansi",
+        "--prompt=:: manx ➜ ",
+        "--header=[Enter] Pick Snippet  •  [Ctrl-O] Full Man  •  [Ctrl-Y] Copy Top  •  [Ctrl-W] cheat.sh  •  [Esc] Quit",
+        "--delimiter=\t:: ",
+        "--with-nth=1,2",
+        f"--preview={script_path} --preview {{1}}",
+        "--preview-window=right,60%,wrap,<100(bottom,50%,wrap)",
+        f"--bind=ctrl-o:execute({script_path} -m {{1}})",
+        f"--bind=ctrl-y:execute-silent({script_path} --copy-top {{1}})+abort",
+        f"--bind=ctrl-w:change-preview({script_path} --preview-web {{1}})",
+        f"--bind=ctrl-t:change-preview({script_path} --preview {{1}})",
+        "--color=bg+:#1f2335,bg:#1a1b26,spinner:#7aa2f7,hl:#7dcfff,fg:#c0caf5,header:#7aa2f7,info:#e0af68,pointer:#bb9af7,marker:#9ece6a,fg+:#c0caf5,prompt:#bb9af7,hl+:#7dcfff"
+    ]
+
+    try:
+        p = subprocess.Popen(fzf_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        out, _ = p.communicate(input=fzf_input)
+        if p.returncode != 0 or not out.strip():
+            return
+
+        # Extract selected command name
+        selected_line = out.strip()
+        cmd_chosen = selected_line.split("\t")[0].strip()
+
+        if cmd_chosen:
+            launch_snippet_picker(cmd_chosen)
+
+    except FileNotFoundError:
+        print_err("fzf is not installed or not in PATH.")
+        sys.exit(1)
+
+# --- COPY TOP SNIPPET HELPER ---
+def copy_top_snippet(cmd_name):
+    cmd_name = cmd_name.strip()
+    tldr_idx = get_tldr_index()
+    if cmd_name in tldr_idx:
+        data = parse_tldr_file(tldr_idx[cmd_name])
+        if data and data.get("examples"):
+            top = data["examples"][0]["clean_cmd"]
+            copy_to_clipboard(top)
+
+# --- PREVIEW HELPERS (CALLED BY FZF) ---
+def preview_command(cmd_name):
+    render_unified_card(cmd_name)
+
+def preview_web(cmd_name):
+    cmd_name = cmd_name.strip()
+    print(f"\n{C_HEAD}:: {C_BOLD}{cmd_name}{NC} \033[38;5;60m(cheat.sh community)\033[0m\n")
+    content = fetch_cheat_sh(cmd_name)
+    if content:
+        for line in content.splitlines()[:80]:
+            if line.startswith("#"):
+                print(f"{C_OPT}{line}{NC}")
+            elif line.startswith("$") or line.startswith(">"):
+                print(f"{C_CMD}{line}{NC}")
+            else:
+                print(f"{C_TEXT}{line}{NC}")
+    else:
+        print(f"  {C_ERR}✖{NC} Unable to fetch cheat.sh for '{cmd_name}' or command offline.")
+
+# --- EXPLAIN COMMAND ---
+def run_explain(cmd_string):
+    print_head(f"Explaining Command: {cmd_string}")
+    output = fetch_mankier_explain(cmd_string)
+    if not output:
+        print_err("Unable to explain command.")
+        return
+
+    # Format Mankier / offline output with Tokyo Night colors
+    for line in output.splitlines():
+        s = line.strip()
+        if s.startswith("-"):
+            print(f"  {C_PROMPT}{s}{NC}")
+        elif re.match(r"^[a-zA-Z0-9_\-]+\([0-9]\)", s):
+            print(f"\n{C_HEAD}:: {C_BOLD}{s}{NC}")
+        elif s.startswith("http"):
+            print(f"  {C_OPT}{s}{NC}")
+        else:
+            print(f"  {C_TEXT}{line}{NC}")
+    print()
+
+# --- UPDATE CACHE ---
+def update_cache():
+    print_head("Updating Documentation Caches")
+    if shutil.which("tldr"):
+        print_action("Running `tldr --update`...")
+        subprocess.run(["tldr", "--update"])
+        print_succ("TLDR pages cache updated.")
+    else:
+        print_err("tldr binary not found to update cache.")
+
+    # Invalidate man index
+    man_cache = os.path.join(get_cache_dir(), "man_index.json")
+    if os.path.exists(man_cache):
+        os.remove(man_cache)
+        print_succ("Refreshed system man index.")
+
+# --- CLI HELP & ROUTER ---
+def print_help():
+    help_text = f"""
+{C_HEAD}:: {C_BOLD}manx{NC} \033[38;5;60mv{VERSION} — Modern Unified CLI Documentation & Interactive Cheatsheets{NC}
+
+{C_BOLD}USAGE:{NC}
+  manx                     Launch interactive FZF command palette & snippet picker
+  manx <command>           Display unified cheatsheet card directly in terminal
+  manx -s, --snippet <cmd> Open interactive snippet picker for a specific command
+  manx -m, --man <cmd>     Open full system man page formatted with bat/less
+  manx -w, --web <cmd>     Query cheat.sh community cheatsheet
+  manx explain "<cmd>"     Explain command flags and syntax breakdown
+  manx search "<query>"    Reverse search across 7,400+ command cheatsheets
+  manx --update            Update local TLDR and documentation caches
+  manx -h, --help          Show this help message
+  manx --version           Show version information
+
+{C_BOLD}INTERACTIVE FZF SHORTCUTS:{NC}
+  {C_PROMPT}[Enter]{NC}   Pick & copy practical snippet directly to clipboard
+  {C_PROMPT}[Ctrl-O]{NC}  Open full system manual in syntax-highlighted pager
+  {C_PROMPT}[Ctrl-Y]{NC}  Instant-copy top/primary snippet and exit
+  {C_PROMPT}[Ctrl-W]{NC}  Switch preview to cheat.sh community sheet
+  {C_PROMPT}[Ctrl-T]{NC}  Switch preview back to unified TLDR card
+"""
+    print(help_text)
+
+def main():
+    if len(sys.argv) == 1:
+        launch_main_fzf()
+        return
+
+    arg1 = sys.argv[1]
+
+    # Internal subcommands for FZF
+    if arg1 == "--preview":
+        if len(sys.argv) > 2:
+            preview_command(sys.argv[2])
+        return
+    elif arg1 == "--preview-web":
+        if len(sys.argv) > 2:
+            preview_web(sys.argv[2])
+        return
+    elif arg1 == "--copy-top":
+        if len(sys.argv) > 2:
+            copy_top_snippet(sys.argv[2])
+        return
+    elif arg1 in ("-s", "--snippet"):
+        if len(sys.argv) > 2:
+            launch_snippet_picker(sys.argv[2])
+        else:
+            print_err("Command required: `manx --snippet <command>`")
+        return
+    elif arg1 in ("-m", "--man"):
+        if len(sys.argv) > 2:
+            open_full_man(sys.argv[2])
+        else:
+            print_err("Command required: `manx --man <command>`")
+        return
+    elif arg1 in ("-w", "--web"):
+        if len(sys.argv) > 2:
+            preview_web(sys.argv[2])
+        else:
+            print_err("Command required: `manx --web <command>`")
+        return
+    elif arg1 == "explain":
+        if len(sys.argv) > 2:
+            run_explain(" ".join(sys.argv[2:]))
+        else:
+            print_err("Command string required: `manx explain \"find . -name '*.txt'\"`")
+        return
+    elif arg1 == "search":
+        if len(sys.argv) > 2:
+            search_cheatsheets(" ".join(sys.argv[2:]))
+        else:
+            print_err("Search query required: `manx search \"tar extract\"`")
+        return
+    elif arg1 == "--update":
+        update_cache()
+        return
+    elif arg1 in ("-h", "--help"):
+        print_help()
+        return
+    elif arg1 in ("-v", "--version"):
+        print(f"manx v{VERSION}")
+        return
+    elif arg1.startswith("-"):
+        print_err(f"Unknown flag: {arg1}")
+        print_help()
+        sys.exit(1)
+    else:
+        # Standard query: manx <command>
+        render_unified_card(arg1)
+
+if __name__ == "__main__":
+    main()
