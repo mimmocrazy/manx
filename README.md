@@ -75,9 +75,9 @@ mx find
 
 | Command | Action |
 | :--- | :--- |
-| `manx` / `mx` | Apre la TUI interattiva `fzf` con preview a colori e picker snippet |
-| `manx <command>` | Stampa istantaneamente la scheda cheatsheet unificata nel terminale |
-| `manx -s, --snippet <cmd>` | Apre direttamente il selettore snippet per quel comando |
+| `manx` / `mx` | Apre la TUI interattiva `fzf` globale con tutti i comandi di sistema |
+| `manx <command>` | Apre lo **Snippet Picker** interattivo per il comando con live preview a colori |
+| `manx -p, --print <cmd>` | Stampa la scheda cheatsheet statica direttamente nel terminale |
 | `manx -m, --man <cmd>` | Apre la man page completa formattata con `bat` o `less -R` |
 | `manx -w, --web <cmd>` | Consulta i cheat sheet della community da `cheat.sh` |
 | `manx explain "<cmd-line>"` | Scompone e spiega il significato di ogni singolo flag della riga di comando |
