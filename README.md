@@ -75,14 +75,14 @@ mx find
 
 | Command | Action |
 | :--- | :--- |
-| `manx` / `mx` | Apre la TUI interattiva `fzf` globale con tutti i comandi di sistema |
-| `manx <command>` | Apre lo **Snippet Picker** interattivo per il comando con live preview a colori |
-| `manx -p, --print <cmd>` | Stampa la scheda cheatsheet statica direttamente nel terminale |
-| `manx -m, --man <cmd>` | Apre la man page completa formattata con `bat` o `less -R` |
+| `manx` / `mx` | Apre la TUI interattiva `fzf` globale con tutti i 12.000+ comandi di sistema |
+| `manx <cmd> [query]` | Apre lo **Snippet & Options Picker** (es. `mx find perm` filtra subito su `-perm`) |
+| `manx -p, --print <cmd> [q]` | Stampa la scheda o i flag cercati direttamente nel terminale in modo statico |
+| `manx -m, --man <cmd>` | Apre la man page completa formattata con `bat` o `less -R` in fullscreen |
 | `manx -w, --web <cmd>` | Consulta i cheat sheet della community da `cheat.sh` |
 | `manx explain "<cmd-line>"` | Scompone e spiega il significato di ogni singolo flag della riga di comando |
 | `manx search "<query>"` | Ricerca semantica/full-text su 7.400+ schede (es. `mx search "extract tar"`) |
-| `manx --update` | Aggiorna la cache locale delle pagine TLDR e rigenera l'indice di sistema |
+| `manx --update` | Aggiorna la cache locale TLDR, man e opzioni |
 | `manx -h, --help` | Mostra la guida dei comandi e delle scorciatoie |
 
 ---
@@ -91,12 +91,13 @@ mx find
 
 | Shortcut | Action |
 | :--- | :--- |
-| `[Enter]` | Seleziona il comando e apre lo **Snippet Picker** per copiare il caso d'uso desiderato |
-| `[Ctrl-O]` | Apre il manuale completo di sistema (`man`) nel pager evidenziato |
+| `[Enter]` | Copia istantaneamente lo snippet o il flag selezionato negli appunti e lo stampa a terminale |
+| `[Alt-M / Ctrl-P]` | Mostra il **Manuale Completo di Sistema (`man`)** formattato a colori direttamente nella preview |
+| `[Ctrl-T]` | Ripristina l'anteprima laterale sulla scheda unificata **TLDR Cheatsheet** |
+| `[Ctrl-W]` | Switcha l'anteprima laterale sui cheat sheet online di **`cheat.sh`** |
+| `[Ctrl-O]` | Apre il manuale completo nel pager a schermo intero (`bat` / `less`) |
 | `[Ctrl-Y]` | Copia istantaneamente il comando d'esempio principale negli appunti ed esce |
-| `[Ctrl-W]` | Cambia l'anteprima laterale mostrando il cheat sheet online di `cheat.sh` |
-| `[Ctrl-T]` | Ripristina l'anteprima laterale sulla scheda unificata locale TLDR |
-| `[Esc]` | Chiude la schermata interattiva |
+| `[Esc]` | Chiude la schermata interattiva lasciando la scheda stampata nel terminale |
 
 ---
 

@@ -121,6 +121,8 @@ def get_cache_dir():
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(os.path.join(cache_dir, "cheat"), exist_ok=True)
     os.makedirs(os.path.join(cache_dir, "explain"), exist_ok=True)
+    os.makedirs(os.path.join(cache_dir, "man"), exist_ok=True)
+    os.makedirs(os.path.join(cache_dir, "options"), exist_ok=True)
     return cache_dir
 
 def find_tldr_root():
@@ -142,6 +144,17 @@ def get_tldr_index():
     if _TLDR_INDEX is not None:
         return _TLDR_INDEX
 
+    cache_file = os.path.join(get_cache_dir(), "tldr_index.json")
+    if os.path.isfile(cache_file):
+        try:
+            mtime = os.path.getmtime(cache_file)
+            if time.time() - mtime < 86400 * 7:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    _TLDR_INDEX = json.load(f)
+                    return _TLDR_INDEX
+        except Exception:
+            pass
+
     root = find_tldr_root()
     index = {}
     if not root:
@@ -160,6 +173,12 @@ def get_tldr_index():
                         index[cmd_name] = entry.path
             except Exception:
                 pass
+
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(index, f)
+    except Exception:
+        pass
 
     _TLDR_INDEX = index
     return index
@@ -347,6 +366,157 @@ def get_all_commands():
         result.append((cmd, desc, source))
 
     return result
+
+# --- MAN PAGE & OPTIONS ENGINE ---
+def get_raw_man(cmd_name):
+    cmd_name = cmd_name.strip()
+    cache_file = os.path.join(get_cache_dir(), "man", f"{cmd_name}.txt")
+    if os.path.isfile(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            pass
+
+    try:
+        res = subprocess.run(["man", cmd_name], capture_output=True, text=True, errors="replace")
+        if res.returncode == 0 and res.stdout:
+            raw = subprocess.run(["col", "-bx"], input=res.stdout, capture_output=True, text=True).stdout
+            try:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    f.write(raw)
+            except Exception:
+                pass
+            return raw
+    except Exception:
+        pass
+    return ""
+
+def get_man_options(cmd_name):
+    cmd_name = cmd_name.strip()
+    cache_file = os.path.join(get_cache_dir(), "options", f"{cmd_name}.json")
+    if os.path.isfile(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    raw = get_raw_man(cmd_name)
+    if not raw:
+        return []
+
+    lines = raw.splitlines()
+    options = []
+    current_opt = None
+    current_desc = []
+
+    for line in lines:
+        m = re.match(r"^ {2,8}(-[a-zA-Z0-9_\-\+]+(?:[^\n]*))$", line)
+        if m:
+            if current_opt and current_desc:
+                tag = current_opt.split()[0].rstrip(",;:")
+                options.append({"tag": tag, "header": current_opt, "desc": " ".join(current_desc).strip()})
+            current_opt = m.group(1).strip()
+            current_desc = []
+        elif current_opt:
+            if re.match(r"^ {6,}\S", line):
+                current_desc.append(line.strip())
+            elif re.match(r"^[A-Z]", line):
+                if current_opt and current_desc:
+                    tag = current_opt.split()[0].rstrip(",;:")
+                    options.append({"tag": tag, "header": current_opt, "desc": " ".join(current_desc).strip()})
+                current_opt = None
+                current_desc = []
+
+    if current_opt and current_desc:
+        tag = current_opt.split()[0].rstrip(",;:")
+        options.append({"tag": tag, "header": current_opt, "desc": " ".join(current_desc).strip()})
+
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(options, f)
+    except Exception:
+        pass
+
+    return options
+
+def preview_man(cmd_name):
+    cmd_name = cmd_name.strip()
+    raw = get_raw_man(cmd_name)
+    if not raw:
+        print(f"\n{C_HEAD}:: {C_BOLD}{cmd_name}{NC} — {C_ERR}No system manual available.{NC}\n")
+        return
+
+    print(f"\n{C_HEAD}:: {C_BOLD}{cmd_name.upper()}(1) — Full System Manual{NC} \033[38;5;60m(Shift-Up/Down to Scroll){NC}\n")
+    for line in raw.splitlines():
+        if re.match(r"^[A-Z][A-Z0-9_\- ]+$", line.strip()) and not line.startswith(" "):
+            print(f"\n{C_HEAD}:: {C_BOLD}{line.strip()}{NC}")
+        elif re.match(r"^\s{2,8}(-[a-zA-Z0-9_\-\+]+.*)$", line):
+            m = re.match(r"^\s{2,8}(-[a-zA-Z0-9_\-\+]+.*)$", line)
+            print(f"  {C_PROMPT}➜ {C_CMD}{m.group(1).strip()}{NC}")
+        else:
+            print(f"  {C_TEXT}{line}{NC}")
+
+def preview_item(item_string, cmd_name):
+    item_string = item_string.strip()
+    cmd_name = cmd_name.strip()
+
+    if item_string.startswith("[-"):
+        opts = get_man_options(cmd_name)
+        opt_part = item_string.split("\t")[0].strip()
+        m_tag = re.match(r"^\[(-[^\]]+)\]\s*(.*)$", opt_part)
+        target_tag = m_tag.group(1) if m_tag else ""
+        target_header = m_tag.group(2).strip() if m_tag else opt_part
+
+        matched = None
+        for o in opts:
+            if o["header"] == target_header or o["tag"] == target_tag:
+                matched = o
+                break
+
+        if matched:
+            print(f"\n{C_HEAD}:: {C_BOLD}{cmd_name}(1) — Flag / Option Reference{NC}\n")
+            print(f"  {C_PROMPT}➜ {C_CMD}{matched['header']}{NC}\n")
+            print(f"{C_HEAD}:: {C_BOLD}Description & Usage:{NC}\n")
+            desc_sentences = matched["desc"].split(". ")
+            cur_p = []
+            for sent in desc_sentences:
+                cur_p.append(sent)
+                if len(". ".join(cur_p)) > 120:
+                    print(f"  {C_TEXT}{'. '.join(cur_p)}.{NC}\n")
+                    cur_p = []
+            if cur_p:
+                print(f"  {C_TEXT}{'. '.join(cur_p)}{NC}\n")
+
+            print(f"{C_DIM}─────────────────────────────────────────────────────────────────────────────{NC}")
+            print(f"  {C_OPT}Switch View:{NC} [Alt-M/Ctrl-P] Full Man Page  {C_MUTED}•{NC}  [Ctrl-T] TLDR  {C_MUTED}•{NC}  [Ctrl-W] cheat.sh\n")
+            return
+
+    if item_string.startswith("[m]"):
+        preview_man(cmd_name)
+        return
+    elif item_string.startswith("[w]"):
+        preview_web(cmd_name)
+        return
+
+    render_unified_card(cmd_name, is_preview=True)
+
+def print_matching_options(cmd_name, query):
+    query_lower = query.lower().strip()
+    opts = get_man_options(cmd_name)
+    matches = [
+        o for o in opts
+        if query_lower in o["tag"].lower() or query_lower in o["header"].lower() or query_lower in o["desc"].lower()
+    ]
+    if not matches:
+        print(f"\n{C_ERR}✖{NC} No options in {cmd_name}(1) matching '{query}'.\n")
+        return
+
+    print(f"\n{C_HEAD}:: {C_BOLD}{cmd_name}(1) — Man Options matching '{query}'{NC} \033[38;5;60m({len(matches)} found)\033[0m\n")
+    for o in matches[:15]:
+        print(f"  {C_PROMPT}➜ {C_CMD}{o['header']}{NC}")
+        print(f"    {C_TEXT}{o['desc'][:220]}...{NC}\n")
 
 # --- CHEAT.SH CLIENT & CACHE ---
 def fetch_cheat_sh(cmd):
@@ -537,8 +707,8 @@ def render_unified_card(cmd_name, is_preview=True):
     else:
         print(f"  {C_OPT}Hint:{NC} Run `manx {cmd_name}` for interactive picker or `manx -m {cmd_name}` for full manual.\n")
 
-# --- INTERACTIVE SNIPPET PICKER ---
-def launch_snippet_picker(cmd_name, print_on_cancel=True):
+# --- INTERACTIVE SNIPPET & OPTIONS PICKER ---
+def launch_snippet_picker(cmd_name, initial_query="", print_on_cancel=True):
     cmd_name = cmd_name.strip()
     tldr_idx = get_tldr_index()
     man_idx = get_system_man_index()
@@ -557,7 +727,10 @@ def launch_snippet_picker(cmd_name, print_on_cancel=True):
     elif cmd_name in builtins:
         desc = builtins[cmd_name]
 
-    if not examples:
+    # Fetch all options/flags from the man page
+    man_options = get_man_options(cmd_name)
+
+    if not examples and not man_options:
         if cmd_name in builtins:
             render_unified_card(cmd_name, is_preview=False)
             return
@@ -567,20 +740,31 @@ def launch_snippet_picker(cmd_name, print_on_cancel=True):
 
     # Prepare FZF lines
     fzf_lines = []
+
+    # 1. Curated TLDR examples
     for idx, eg in enumerate(examples, start=1):
         clean = eg["clean_cmd"]
         eg_desc = eg["desc"]
-        fzf_lines.append(f"[{idx}] {clean} \t:: {eg_desc}")
+        fzf_lines.append(f"[{idx}] {clean} \t:: [snippet] {eg_desc}")
 
-    # Add option to open full manual & cheat.sh
-    fzf_lines.append(f"[m] 📖 Open Full System Manual (man {cmd_name}) \t:: Complete reference")
-    fzf_lines.append(f"[w] 🌐 Query cheat.sh Community Cheatsheet \t:: Community snippets")
+    # 2. Options and flags extracted from system man page
+    for opt in man_options:
+        tag = opt["tag"]
+        header = opt["header"]
+        short_desc = opt["desc"][:90]
+        if len(opt["desc"]) > 90:
+            short_desc += "..."
+        fzf_lines.append(f"[{tag}] {header} \t:: [man] {short_desc}")
+
+    # 3. Actions to toggle views
+    fzf_lines.append(f"[m] 📖 View Full Man Page in Preview (Alt-M / Ctrl-P) \t:: [action] Complete system reference")
+    fzf_lines.append(f"[w] 🌐 Query cheat.sh Community Sheet (Ctrl-W) \t:: [action] Community snippets")
 
     fzf_input = "\n".join(fzf_lines)
     script_path = os.path.abspath(__file__)
 
     short_desc = (desc[:60] + "...") if len(desc) > 60 else desc
-    header_text = f":: {cmd_name} — {short_desc}\n[Enter] Copy & Output  •  [Ctrl-O] Full Man  •  [Ctrl-W] cheat.sh  •  [Esc] Cancel"
+    header_text = f":: {cmd_name} — {short_desc}\n[Enter] Copy & Output  •  [Alt-M/Ctrl-P] Man Page  •  [Ctrl-T] TLDR  •  [Ctrl-W] cheat.sh  •  [Esc] Cancel"
 
     cmd = [
         "fzf",
@@ -589,13 +773,18 @@ def launch_snippet_picker(cmd_name, print_on_cancel=True):
         f"--header={header_text}",
         "--delimiter=\t:: ",
         "--with-nth=1,2",
-        f"--preview={script_path} --preview {cmd_name}",
-        "--preview-window=right,55%,wrap,<100(bottom,50%,wrap)",
+        f"--preview={script_path} --preview-item {{1}} {cmd_name}",
+        "--preview-window=right,58%,wrap,<100(bottom,50%,wrap)",
         f"--bind=ctrl-o:execute({script_path} -m {cmd_name})",
         f"--bind=ctrl-w:change-preview({script_path} --preview-web {cmd_name})",
         f"--bind=ctrl-t:change-preview({script_path} --preview {cmd_name})",
+        f"--bind=ctrl-p:change-preview({script_path} --preview-man {cmd_name})",
+        f"--bind=alt-m:change-preview({script_path} --preview-man {cmd_name})",
         "--color=bg+:#1f2335,bg:#1a1b26,spinner:#7aa2f7,hl:#7dcfff,fg:#c0caf5,header:#7aa2f7,info:#e0af68,pointer:#bb9af7,marker:#9ece6a,fg+:#c0caf5,prompt:#bb9af7,hl+:#7dcfff"
     ]
+
+    if initial_query:
+        cmd.append(f"--query={initial_query}")
 
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -606,16 +795,15 @@ def launch_snippet_picker(cmd_name, print_on_cancel=True):
             return
 
         selected = out.strip()
-        if "[m] 📖 Open Full System Manual" in selected:
+        if "[m] 📖 View Full Man Page" in selected:
             open_full_man(cmd_name)
             return
-        elif "[w] 🌐 Query cheat.sh Community" in selected:
+        elif "[w] 🌐 Query cheat.sh" in selected:
             preview_web(cmd_name)
             return
 
-        # Extract snippet command
-        # Format: '[1] cmd ... \t:: desc'
-        m = re.match(r"^\[\d+\]\s*(.*?)(?:\s*\t::.*)?$", selected)
+        # Extract snippet or option command
+        m = re.match(r"^\[(?:\d+|-[^\]]+)\]\s*(.*?)(?:\s*\t::.*)?$", selected)
         chosen_cmd = m.group(1).strip() if m else selected
 
         # Copy to clipboard
@@ -740,7 +928,7 @@ def launch_main_fzf():
         "fzf",
         "--ansi",
         "--prompt=:: manx ➜ ",
-        "--header=[Enter] Pick Snippet  •  [Ctrl-O] Full Man  •  [Ctrl-Y] Copy Top  •  [Ctrl-W] cheat.sh  •  [Esc] Quit",
+        "--header=[Enter] Pick Snippet & Options  •  [Alt-M/Ctrl-P] Man Page  •  [Ctrl-T] TLDR  •  [Ctrl-W] cheat.sh  •  [Esc] Quit",
         "--delimiter=\t:: ",
         "--with-nth=1,2",
         f"--preview={script_path} --preview {{1}}",
@@ -749,6 +937,8 @@ def launch_main_fzf():
         f"--bind=ctrl-y:execute-silent({script_path} --copy-top {{1}})+abort",
         f"--bind=ctrl-w:change-preview({script_path} --preview-web {{1}})",
         f"--bind=ctrl-t:change-preview({script_path} --preview {{1}})",
+        f"--bind=ctrl-p:change-preview({script_path} --preview-man {{1}})",
+        f"--bind=alt-m:change-preview({script_path} --preview-man {{1}})",
         "--color=bg+:#1f2335,bg:#1a1b26,spinner:#7aa2f7,hl:#7dcfff,fg:#c0caf5,header:#7aa2f7,info:#e0af68,pointer:#bb9af7,marker:#9ece6a,fg+:#c0caf5,prompt:#bb9af7,hl+:#7dcfff"
     ]
 
@@ -829,11 +1019,19 @@ def update_cache():
     else:
         print_err("tldr binary not found to update cache.")
 
-    # Invalidate man index
-    man_cache = os.path.join(get_cache_dir(), "man_index.json")
-    if os.path.exists(man_cache):
-        os.remove(man_cache)
-        print_succ("Refreshed system man index.")
+    cdir = get_cache_dir()
+    for fname in ["man_index.json", "tldr_index.json"]:
+        fpath = os.path.join(cdir, fname)
+        if os.path.exists(fpath):
+            os.remove(fpath)
+
+    for sub in ["man", "options", "cheat", "explain"]:
+        sdir = os.path.join(cdir, sub)
+        if os.path.isdir(sdir):
+            shutil.rmtree(sdir)
+            os.makedirs(sdir, exist_ok=True)
+
+    print_succ("Refreshed all local indices and cache files.")
 
 # --- CLI HELP & ROUTER ---
 def print_help():
@@ -841,9 +1039,9 @@ def print_help():
 {C_HEAD}:: {C_BOLD}manx{NC} \033[38;5;60mv{VERSION} — Modern Unified CLI Documentation & Interactive Cheatsheets{NC}
 
 {C_BOLD}USAGE:{NC}
-  manx                     Launch interactive FZF command palette & snippet picker
-  manx <command>           Open interactive snippet picker with live preview
-  manx -p, --print <cmd>   Display static cheatsheet card directly in terminal
+  manx                     Launch interactive FZF command palette across all commands
+  manx <cmd> [query]       Open interactive snippet & option picker (e.g. `mx find perm`)
+  manx -p <cmd> [query]    Display static card or filter options (e.g. `mx -p find perm`)
   manx -s, --snippet <cmd> Open interactive snippet picker for a specific command
   manx -m, --man <cmd>     Open full system man page formatted with bat/less
   manx -w, --web <cmd>     Query cheat.sh community cheatsheet
@@ -854,11 +1052,12 @@ def print_help():
   manx --version           Show version information
 
 {C_BOLD}INTERACTIVE FZF SHORTCUTS:{NC}
-  {C_PROMPT}[Enter]{NC}   Pick & copy practical snippet directly to clipboard
-  {C_PROMPT}[Ctrl-O]{NC}  Open full system manual in syntax-highlighted pager
-  {C_PROMPT}[Ctrl-Y]{NC}  Instant-copy top/primary snippet and exit
-  {C_PROMPT}[Ctrl-W]{NC}  Switch preview to cheat.sh community sheet
-  {C_PROMPT}[Ctrl-T]{NC}  Switch preview back to unified TLDR card
+  {C_PROMPT}[Enter]{NC}           Pick & copy practical snippet or flag directly to clipboard
+  {C_PROMPT}[Alt-M / Ctrl-P]{NC}  Switch preview pane to Full System Man Page
+  {C_PROMPT}[Ctrl-T]{NC}          Switch preview pane to Unified TLDR Cheatsheet Card
+  {C_PROMPT}[Ctrl-W]{NC}          Switch preview pane to cheat.sh Community Sheet
+  {C_PROMPT}[Ctrl-O]{NC}          Open full system manual in external pager (bat/less)
+  {C_PROMPT}[Ctrl-Y]{NC}          Instant-copy top/primary snippet and exit
 """
     print(help_text)
 
@@ -869,10 +1068,20 @@ def main():
 
     arg1 = sys.argv[1]
 
-    # Internal subcommands for FZF
+    # --- FAST PATH: PREVIEWS (Zero startup overhead for FZF 60fps responsiveness) ---
     if arg1 == "--preview":
         if len(sys.argv) > 2:
-            preview_command(sys.argv[2])
+            render_unified_card(sys.argv[2], is_preview=True)
+        return
+    elif arg1 == "--preview-man":
+        if len(sys.argv) > 2:
+            preview_man(sys.argv[2])
+        return
+    elif arg1 == "--preview-item":
+        if len(sys.argv) > 3:
+            preview_item(sys.argv[2], sys.argv[3])
+        elif len(sys.argv) > 2:
+            render_unified_card(sys.argv[2], is_preview=True)
         return
     elif arg1 == "--preview-web":
         if len(sys.argv) > 2:
@@ -882,15 +1091,23 @@ def main():
         if len(sys.argv) > 2:
             copy_top_snippet(sys.argv[2])
         return
-    elif arg1 in ("-p", "--print"):
+
+    # --- CLI COMMAND ROUTING ---
+    if arg1 in ("-p", "--print"):
         if len(sys.argv) > 2:
-            render_unified_card(sys.argv[2], is_preview=False)
+            target_cmd = sys.argv[2]
+            query = " ".join(sys.argv[3:]).strip() if len(sys.argv) > 3 else ""
+            if query:
+                print_matching_options(target_cmd, query)
+            else:
+                render_unified_card(target_cmd, is_preview=False)
         else:
-            print_err("Command required: `manx --print <command>`")
+            print_err("Command required: `manx --print <command> [query]`")
         return
     elif arg1 in ("-s", "--snippet"):
         if len(sys.argv) > 2:
-            launch_snippet_picker(sys.argv[2])
+            query = " ".join(sys.argv[3:]).strip() if len(sys.argv) > 3 else ""
+            launch_snippet_picker(sys.argv[2], initial_query=query)
         else:
             print_err("Command required: `manx --snippet <command>`")
         return
@@ -932,11 +1149,16 @@ def main():
         print_help()
         sys.exit(1)
     else:
-        # Standard query: manx <command>
+        # Standard query: manx <command> [query...]
+        target_cmd = arg1
+        query = " ".join(sys.argv[2:]).strip() if len(sys.argv) > 2 else ""
         if sys.stdout.isatty():
-            launch_snippet_picker(arg1, print_on_cancel=True)
+            launch_snippet_picker(target_cmd, initial_query=query, print_on_cancel=True)
         else:
-            render_unified_card(arg1, is_preview=False)
+            if query:
+                print_matching_options(target_cmd, query)
+            else:
+                render_unified_card(target_cmd, is_preview=False)
 
 if __name__ == "__main__":
     main()
