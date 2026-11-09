@@ -61,7 +61,7 @@
 git clone https://github.com/mimmocrazy/manx.git ~/.local/share/manx && ~/.local/share/manx/install.sh
 ```
 
-Clona il repo in `~/.local/share/manx` e crea i symlink `manx` e `mx` in `~/.local/bin` (assicurati che sia nel tuo `PATH`).
+Clona il repo in `~/.local/share/manx`, installa `fzf` se manca (apt, dnf, pacman, zypper, apk, brew o fallback in `~/.fzf`) e crea i symlink `manx` e `mx` in `~/.local/bin` (assicurati che sia nel tuo `PATH`).
 
 ### Aggiornamento
 
