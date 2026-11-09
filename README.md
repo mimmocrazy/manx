@@ -55,18 +55,25 @@
 
 ## Quick Start
 
+### Installazione (one-liner)
+
 ```bash
-# 1. Clone repository
-git clone https://github.com/mimmocrazy/manx.git ~/Projects/COMMANDS/manx
+git clone https://github.com/mimmocrazy/manx.git ~/.local/share/manx && ~/.local/share/manx/install.sh
+```
 
-# 2. Setup executable & global symlinks (manx + mx alias)
-chmod +x ~/Projects/COMMANDS/manx/install.sh
-~/Projects/COMMANDS/manx/install.sh
+Clona il repo in `~/.local/share/manx` e crea i symlink `manx` e `mx` in `~/.local/bin` (assicurati che sia nel tuo `PATH`).
 
-# 3. Launch
-manx
-# oppure con l'alias rapido
-mx find
+### Aggiornamento
+
+```bash
+git -C ~/.local/share/manx pull
+```
+
+### Utilizzo
+
+```bash
+manx          # TUI interattiva globale
+mx find       # alias rapido: snippet picker per "find"
 ```
 
 ---
